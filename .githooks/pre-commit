@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
+
+
+LIMIT = 100 * 1024 * 1024
+
+
+def git(*args, **kwargs):
+    return subprocess.check_output(("git", *args), **kwargs)
+
+
+def compress(source, output):
+    ghostscript = shutil.which("gs")
+    if not ghostscript:
+        raise RuntimeError("Install Ghostscript (on macOS: brew install ghostscript).")
+
+    for resolution in (240, 180, 120):
+        subprocess.run(
+            [
+                ghostscript, "-q", "-dBATCH", "-dNOPAUSE", "-dSAFER",
+                "-dPDFSTOPONERROR", "-sDEVICE=pdfwrite",
+                "-dDetectDuplicateImages=false", "-dPassThroughJPEGImages=false",
+                "-dPassThroughJPXImages=false", "-dAutoRotatePages=/None",
+                *(
+                    option
+                    for color in ("Color", "Gray", "Mono")
+                    for option in (
+                        f"-dDownsample{color}Images=true",
+                        f"-d{color}ImageDownsampleThreshold=1.0",
+                        f"-d{color}ImageResolution={resolution}",
+                    )
+                ),
+                "-dColorImageDownsampleType=/Bicubic",
+                "-dGrayImageDownsampleType=/Bicubic",
+                "-sOutputFile=" + str(output),
+                str(source),
+            ],
+            check=True,
+        )
+        if 0 < output.stat().st_size <= LIMIT:
+            return
+    raise RuntimeError("PDF still exceeds 100 MiB after compression at 120 ppi.")
+
+
+def main():
+    entries = git("ls-files", "--stage", "-z", "--", "files/")
+    updates = []
+    for entry in entries.split(b"\0")[:-1]:
+        metadata, raw_path = entry.split(b"\t", 1)
+        mode, oid, stage = metadata.split()
+        if mode not in (b"100644", b"100755") or stage != b"0":
+            continue
+        path = Path(os.fsdecode(raw_path))
+        if path.suffix.lower() != ".pdf":
+            continue
+        if int(git("cat-file", "-s", oid)) <= LIMIT:
+            continue
+
+        print(f"Compressing staged PDF {path} …", file=sys.stderr, flush=True)
+        with TemporaryDirectory(prefix="windmill-pdf-") as directory:
+            source = Path(directory) / "source.pdf"
+            output = Path(directory) / "compressed.pdf"
+            with source.open("wb") as stream:
+                subprocess.run(("git", "cat-file", "blob", oid), stdout=stream, check=True)
+            compress(source, output)
+            compressed_oid = git("hash-object", "-w", "--no-filters", "--", str(output)).strip()
+            updates.append((raw_path, mode, compressed_oid))
+            print(
+                f"Staged version of {path} will be {output.stat().st_size / 1024**2:.1f} MiB. "
+                "Your local PDF stays at full resolution.",
+                file=sys.stderr,
+            )
+
+    if updates:
+        index_info = b"".join(mode + b" " + oid + b"\t" + path + b"\0"
+                              for path, mode, oid in updates)
+        git("update-index", "-z", "--index-info", input=index_info)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        sys.exit(f"PDF compression failed: {error}")

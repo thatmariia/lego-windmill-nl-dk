@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+
+LIMIT = 100 * 1024 * 1024
+
+
+def main():
+    for line in sys.stdin.buffer:
+        local_ref, local_oid, remote_ref, remote_oid = line.split()
+        if not local_oid.strip(b"0"):
+            continue
+
+        revisions = [local_oid]
+        if remote_oid.strip(b"0"):
+            revisions.append(b"^" + remote_oid)
+
+        objects = subprocess.check_output(["git", "rev-list", "--objects", *revisions])
+        details = subprocess.check_output(
+            ["git", "cat-file", "--batch-check=%(objecttype) %(objectsize) %(rest)"],
+            input=objects,
+        )
+        for row in details.split(b"\n"):
+            kind, _, rest = row.partition(b" ")
+            if kind != b"blob":
+                continue
+            size, _, path = rest.partition(b" ")
+            if int(size) > LIMIT:
+                sys.exit(
+                    f"Push blocked: {path.decode(errors='replace')} exceeds 100 MiB in outgoing history.\n"
+                    "Replace the oversized blob in the commit that introduced it. "
+                    "Adding a smaller file in a later commit leaves the oversized blob in history."
+                )
+
+
+if __name__ == "__main__":
+    main()
